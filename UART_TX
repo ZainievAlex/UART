@@ -1,0 +1,100 @@
+-- 29.09.2022
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.STD_LOGIC_ARITH.ALL;
+use IEEE.STD_LOGIC_UNSIGNED.ALL;
+
+entity UART_TX IS
+  generic(
+    clk_freq  :  integer    := 100_000_000; 				-- Частота системных часов
+    baud_rate :  integer    := 9_600;      					-- Скорость передачи данных в битах в секунду
+    d_width   :  integer    := 8;           				-- Ширина линии данных
+    parity    :  integer    := 1;           				-- Флаг 0 для отсутствия четности, 1 для четности (ПРД)
+    parity_eo :  std_logic  := '0'        					-- Флаг '0' для четной, '1' для нечетной четности (ПРМ)
+    );
+  port(
+    clk      :  in   std_logic;                             -- Системные часы
+    reset_n  :  in   std_logic;                             -- Сброс (асинхронный)негативный скачок
+
+    tx_ena   :  in   std_logic;                             -- Разрешающий сигнал на передачу (инициализация)
+    tx_data  :  in   std_logic_vector(d_width-1 downto 0);  -- Данные для передачи
+    tx       :  out  std_logic;	                            -- Передача
+    tx_busy  :  out  std_logic                              -- Передача данных (процесс) флаг занятости
+    ); 
+end UART_TX;
+
+architecture behavior of UART_TX is
+	type   tx_machine is(idle, transmit);                       								-- Тип данных конечного автомата для передачи
+	signal tx_state     :  tx_machine;                          								-- Конечный автомат передачи
+	signal baud_pulse   :  std_logic := '0';                    								-- Периодический импульс, который возникает на скорости передачи
+	signal tx_parity    :  std_logic_vector(d_width downto 0);  								-- Расчет четности передачи
+	signal tx_buffer    :  std_logic_vector(parity+d_width+1 downto 0) := (others => '1'); 		-- Значения для передачи (сдвиговый регистр)
+begin
+
+-- Генерация импульсов разрешения синхронизации на скорости передачи данных и скорости передискретизации
+process(reset_n, clk)
+    variable count_baud :  integer range 0 to clk_freq/baud_rate-1 := 0;         -- Счетчик для определения периода скорости передачи данных
+begin
+    if(reset_n = '0') then                           		-- Сброс
+		baud_pulse <= '0';                                	-- Сбросить импульс скорости передачи данных
+		count_baud := 0;                                  	-- Сброс счетчика периода в бодах
+    elsif(clk'event and clk = '1') then
+		-- Cоздание бод импульса
+		if(count_baud < clk_freq/baud_rate-1) then        	-- Период передачи не достигнут
+			count_baud := count_baud + 1;                   -- Увеличение счетчика периода передачи
+			baud_pulse <= '0';                              -- Сброс импульса скорости передачи
+		else                                              	-- Достигнут период передачи
+			count_baud := 0;                                -- Сброс счетчика периода в бодах
+			baud_pulse <= '1';                              -- Утвердить импульс скорости передачи данных
+		end if;
+    end if;
+end process;
+
+  -- Основной пророцесс передачи
+process(reset_n, clk)
+    variable tx_count :  integer range 0 to parity+d_width+3 := 0;  			-- количество переданных битов
+begin
+    if(reset_n = '0') then                                    					-- Сброс (асинхронный)
+		tx_count := 0;                                            				-- Сброс счетчика передаваемых битов
+		tx <= '1';                                                				-- Установка вывода tx на высокий уровень (Передача)
+		tx_busy <= '1';                                           				-- Установка сигнала занятости передачи для индикации недоступности
+		tx_state <= idle;                                         				-- Установить tx в состояние готовности
+    elsif(clk'event and clk = '1') then
+		case tx_state IS
+			when idle =>                                              			-- Состояние бездействия
+				if(tx_ena = '1') then                                     		-- Разрешение на передачу
+					tx_buffer(d_width+1 downto 0) <=  tx_data & '0' & '1';  	-- Зафиксированы данные для передачи и стартовые/стоповые биты
+					if(parity = 1) then                                     	-- Флаг четности
+						tx_buffer(parity+d_width+1) <= tx_parity(d_width);  	-- Защелка в бите четности из логики четности
+					end if;
+					tx_busy <= '1';                                         	-- Утвердить флаг занятости передачи
+					tx_count := 0;                                          	-- Сброс счетчика передаваемых битов
+					tx_state <= transmit;                                   	-- Переход к состоянию передачи
+				else                                                      		-- Новая передача не инициирована
+					tx_busy <= '0';                                         	-- Сброс флага занятости передачи
+					tx_state <= idle;                                       	-- Оставаться в нерабочем состоянии
+				end if;
+			when transmit =>                                          			-- Состояние передачи
+				if(baud_pulse = '1') then                                 		-- Начало бита
+					tx_count := tx_count + 1;                               	-- Увеличение счетчик передаваемых битов
+					tx_buffer <= '1' & tx_buffer(parity+d_width+1 downto 1);	-- Сдвиг буфера передачи для вывода следующего бита
+				end if;
+				if(tx_count < parity+d_width+3) then                      		-- Не все биты переданы
+					tx_state <= transmit;                                   	-- Оставаться в состоянии передачи
+				else                                                      		-- Все биты переданы
+					tx_state <= idle;                                       	-- Оставаться в нерабочем состоянии
+				end if;
+			end case;
+		tx <= tx_buffer(0);                                       				-- Выводить последний бит в буфер транзакции передачи
+    end if;
+end process;
+
+  -- Логика расчета четности передачи
+tx_parity(0) <= parity_eo;
+tx_parity_logic: for i in 0 to d_width-1
+generate
+    tx_parity(i+1) <= tx_parity(i) xor tx_data(i);
+end generate;
+
+end behavior;
