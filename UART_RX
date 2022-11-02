@@ -1,0 +1,131 @@
+-- 29.09.2022
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.STD_LOGIC_ARITH.ALL;
+use IEEE.STD_LOGIC_UNSIGNED.ALL;
+
+entity UART_RX IS
+  generic(
+    clk_freq  :  integer    := 100_000_000; 				-- Частота системных часов
+    baud_rate :  integer    := 9_600;      					-- Скорость передачи данных в битах в секунду
+    os_rate   :  integer    := 16;          				-- Скорость передискретизации для поиска центра приема битов (в выборках за период в бодах)
+    d_width   :  integer    := 8;           				-- Ширина линии данных
+    parity    :  integer    := 1;           				-- Флаг 0 для отсутствия четности, 1 для четности (ПРД)
+    parity_eo :  std_logic  := '0'        					-- Флаг '0' для четной, '1' для нечетной четности (ПРМ)
+    );
+  port(
+    clk      :  in   std_logic;                             -- Системные часы
+    reset_n  :  in   std_logic;                             -- Сброс (асинхронный)негативный скачок
+
+    rx       :  in   std_logic;                             -- Прием
+    rx_busy  :  out  std_logic;                             -- Прием данных (процесс) флаг занятости
+    rx_error :  out  std_logic;                             -- Обнаружена ошибка (стартового, четного или стопового бита)
+    rx_data  :  out  std_logic_vector(d_width-1 downto 0) 	-- Данные приема
+    ); 
+end UART_RX;
+
+architecture behavior of UART_RX is
+	type   rx_machine is(idle, receive);                        								-- Тип данных конечного автомата для приема
+	signal rx_state     :  rx_machine;                          								-- Конечный автомат приема
+	signal baud_pulse   :  std_logic := '0';                    								-- Периодический импульс, который возникает на скорости передачи
+	signal os_pulse     :  std_logic := '0';                    								-- Периодический импульс, возникающий при частоте передискретизации
+	signal parity_error :  std_logic;                           								-- Флаг ошибки четности
+	signal rx_parity    :  std_logic_vector(d_width downto 0);  								-- Расчет четности приема
+	signal rx_buffer    :  std_logic_vector(parity+d_width downto 0) := (others => '0');  		-- Полученные значения (сдвиговый регистр)
+begin
+
+-- Генерация импульсов разрешения синхронизации на скорости передачи данных и скорости передискретизации
+process(reset_n, clk)
+    variable count_baud :  integer range 0 to clk_freq/baud_rate-1 := 0;         -- Счетчик для определения периода скорости передачи данных
+    variable count_os   :  integer range 0 to clk_freq/baud_rate/os_rate-1 := 0; -- Счетчик для определения периода передискретизации
+begin
+    if(reset_n = '0') then                           		-- Сброс
+		baud_pulse <= '0';                                	-- Сбросить импульс скорости передачи данных
+		os_pulse <= '0';                                  	-- Сбросить импульс скорости передискретизации
+		count_baud := 0;                                  	-- Сброс счетчика периода в бодах
+		count_os := 0;                                    	-- Сбросить счетчик периода передискретизации
+    elsif(clk'event and clk = '1') then
+		-- Cоздание бод импульса
+		if(count_baud < clk_freq/baud_rate-1) then        	-- Период передачи не достигнут
+			count_baud := count_baud + 1;                   -- Увеличение счетчика периода передачи
+			baud_pulse <= '0';                              -- Сброс импульса скорости передачи
+		else                                              	-- Достигнут период передачи
+			count_baud := 0;                                -- Сброс счетчика периода в бодах
+			baud_pulse <= '1';                              -- Утвердить импульс скорости передачи данных
+			count_os := 0;                                  -- Сброс счетчика периода передискретизации, чтобы избежать ошибки
+		end if;
+		-- Создание передискретизациии импульса
+      if(count_os < clk_freq/baud_rate/os_rate-1) then  	-- Период передискретизации не достигнут
+			count_os := count_os + 1;                       -- Увечение счетчика периода передискретизации
+			os_pulse <= '0';                                -- Импульс скорости передискретизации  
+      else                                              	-- Достигнут период передискретизации
+			count_os := 0;                                  -- Сброс счетчика периода передискретизации
+			os_pulse <= '1';                                -- Утвердить импульс передискретизации
+      end if;
+    end if;
+end process;
+
+  -- Основной процесс приема
+process(reset_n, clk, os_pulse)
+    variable rx_count :  integer range 0 to parity+d_width+2 := 0; 			-- Счетчик полученных бит
+    variable os_count :  integer range 0 to os_rate-1 := 0;        			-- Счетчик импульсов частоты передискретизации
+begin
+    if(reset_n = '0') then                                 				  	-- Сброс
+		os_count := 0;                                         			  	-- Сброс счетчика импульсов передискретизации
+		rx_count := 0;                                         			  	-- Сброс счетчика приемных битов
+		rx_busy <= '0';                                        			  	-- Сброс сигнала "занято" (процесса)
+		rx_error <= '0';                                       			  	-- Сброс ошибки приема
+		rx_data <= (others => '0');                            			  	-- Сброс вывода полученных данных
+		rx_state <= idle;                                      			  	-- Поставить в нерабочее состояние Машину конечных автоматов
+    elsif(clk'event and clk = '1' and os_pulse = '1') then 			      	--
+		case rx_state is
+		when idle =>   -- Состояние бездействия
+			rx_busy <= '0';                                        	  		-- Сброс флага приема "занято"
+			if(rx = '0') then                                      		  	-- Стартовый бит может присутствовать
+				if(os_count < os_rate/2) then                          	  	-- Счетчик импульсов передискретизации не находится в центре начального бита
+					os_count := os_count + 1;                             	-- Увеличение счетчика импульсов передискретизации
+					rx_state <= idle;                                     	-- Оставаться в нерабочем состоянии
+				else                                                      	-- Счетчик импульсов передискретизации находится в центре бита
+					os_count := 0;                                        	-- Сброс счетчика импульсов передискретизации
+					rx_count := 0;                                        	-- Сброс счетчика полученных битов
+					rx_busy <= '1';                                       	-- Установить флаг занятости
+					rx_buffer <= rx & rx_buffer(parity+d_width downto 1); 	-- Сдвинуть начальный бит в приемный буфер							
+					rx_state <= receive;                                  	-- Получить состояние
+				end if;
+			else                                                   	      	-- Стартовый бит отсутствует
+				os_count := 0;                                         	  	-- Сброс счетчика импульсов передискретизации
+				rx_state <= idle;                                      	  	-- Оставаться в нерабочем состоянии
+			end if;
+		when receive => -- Состояние ПРИЕМА
+			if(os_count < os_rate-1) then                          	      	-- Не в центре бита
+				os_count := os_count + 1;                              	  	-- Увеличение счетчика импульсов передискретизации
+				rx_state <= receive;                                   	  	-- Оставаться в состоянии приема
+			elsif(rx_count < parity+d_width) then                  		  	-- Центр бита и не все биты получены
+				os_count := 0;                                         	  	-- Сброс счетчика импульсов передискретизации  
+				rx_count := rx_count + 1;                              	  	-- Увеличение счетчика количества полученных битов счетчика
+				rx_buffer <= rx & rx_buffer(parity+d_width downto 1);  	  	-- Сместить новый полученный бит в приемный буфер
+				rx_state <= receive;                                   	  	-- Оставаться в состоянии приема
+			else                                                   	      	-- Центр стопового бита
+				rx_data <= rx_buffer(d_width downto 1);                	  	-- Вывод полученных данных
+				rx_error <= rx_buffer(0) or parity_error or not rx;    	  	-- Выходной флаг ошибки начала, четности и стопового бита
+				rx_busy <= '0';                                        	  	-- Получение флага занятости
+				rx_state <= idle;                                      	  	-- Оставаться в нерабочем состоянии
+			end if;
+		end case;
+    end if;
+end process;
+
+  -- Логика расчета четности
+  rx_parity(0) <= parity_eo;
+  rx_parity_logic: for i in 0 to d_width-1 
+  generate
+    rx_parity(i+1) <= rx_parity(i) xor rx_buffer(i+1);
+  end generate;
+
+  -- Сравнение вычисленного бита четности с полученным битом четности, чтобы определить ошибку
+  with parity select  
+    parity_error <= rx_parity(d_width) xor rx_buffer(parity+d_width) when 1,-- Флаг ошибки
+    '0' when others;                                         			    -- Отсутствие флага
+
+end behavior;
